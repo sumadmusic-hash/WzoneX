@@ -1,5 +1,9 @@
 // OPERATION IRON FRONT - Main Game Engine
 import * as THREE from 'three';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import {
   GameState, GameUnit, GameBuilding, Projectile, Particle, ResourceDeposit,
   UnitType, BuildingType, Team, Vec3, UNIT_STATS, BUILDING_STATS,
@@ -293,28 +297,40 @@ function createVehicleMesh(type: UnitType, team: Team): THREE.Group {
     }
   }
 
-  // Add selection indicator ring
+  // Add selection indicator ring (glowing — picked up by bloom pass)
   const ring = new THREE.Mesh(
-    new THREE.RingGeometry(1.5, 1.7, 32),
-    new THREE.MeshBasicMaterial({ color: team === 'player' ? 0x00ff00 : 0xff0000, side: THREE.DoubleSide, transparent: true, opacity: 0 })
+    new THREE.RingGeometry(1.45, 1.68, 48),
+    new THREE.MeshBasicMaterial({
+      color: team === 'player' ? 0x00ff88 : 0xff4444,
+      side: THREE.DoubleSide, transparent: true, opacity: 0,
+      blending: THREE.AdditiveBlending, depthWrite: false
+    })
   );
   ring.rotation.x = -Math.PI / 2;
   ring.position.y = 0.05;
   ring.name = 'selectionRing';
   group.add(ring);
 
-  // Health bar
+  // Health bar (dark background + glowing fill)
   const hpBg = new THREE.Mesh(
-    new THREE.PlaneGeometry(2, 0.15),
-    new THREE.MeshBasicMaterial({ color: 0x333333, side: THREE.DoubleSide })
+    new THREE.PlaneGeometry(2.1, 0.26),
+    new THREE.MeshBasicMaterial({ color: 0x0a0a0a, side: THREE.DoubleSide, transparent: true, opacity: 0.9, depthWrite: false })
   );
   hpBg.position.set(0, 2.5, 0);
   hpBg.name = 'hpBg';
   group.add(hpBg);
 
+  const hpBorder = new THREE.Mesh(
+    new THREE.PlaneGeometry(2.18, 0.34),
+    new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.DoubleSide, transparent: true, opacity: 0.55, depthWrite: false })
+  );
+  hpBorder.position.set(0, 2.5, -0.01);
+  hpBorder.name = 'hpBorder';
+  group.add(hpBorder);
+
   const hpBar = new THREE.Mesh(
-    new THREE.PlaneGeometry(2, 0.15),
-    new THREE.MeshBasicMaterial({ color: team === 'player' ? 0x00ff00 : 0xff3333, side: THREE.DoubleSide })
+    new THREE.PlaneGeometry(2, 0.16),
+    new THREE.MeshBasicMaterial({ color: team === 'player' ? 0x3dff7a : 0xff5555, side: THREE.DoubleSide, depthWrite: false })
   );
   hpBar.position.set(0, 2.5, 0.01);
   hpBar.name = 'hpBar';
@@ -323,12 +339,36 @@ function createVehicleMesh(type: UnitType, team: Team): THREE.Group {
   group.castShadow = true;
   group.traverse((child) => {
     if (child instanceof THREE.Mesh) {
-      child.castShadow = true;
-      child.receiveShadow = true;
+      // Don't force shadows on billboarded HUD elements
+      if (['hpBg', 'hpBar', 'hpBorder', 'selectionRing'].includes(child.name)) {
+        child.castShadow = false;
+        child.receiveShadow = false;
+      } else {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
     }
   });
 
   return group;
+}
+
+// Soft round sprite texture for particles (radial gradient)
+let particleSpriteTexture: THREE.Texture | null = null;
+function getParticleSprite(): THREE.Texture {
+  if (particleSpriteTexture) return particleSpriteTexture;
+  const c = document.createElement('canvas');
+  c.width = 64; c.height = 64;
+  const ctx = c.getContext('2d')!;
+  const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.4, 'rgba(255,255,255,0.7)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 64, 64);
+  const tex = new THREE.CanvasTexture(c);
+  particleSpriteTexture = tex;
+  return tex;
 }
 
 function createBuildingMesh(type: BuildingType, team: Team): THREE.Group {
@@ -673,6 +713,10 @@ export class GameEngine {
   private terrainMesh!: THREE.Mesh;
   private fogParticles: THREE.Points | null = null;
   private ambientParticles: THREE.Points | null = null;
+  private composer!: EffectComposer;
+  private bloomPass!: UnrealBloomPass;
+  private dirLight!: THREE.DirectionalLight;
+  private quality: 'high' | 'low' = 'high';
 
   constructor(container: HTMLElement, onStateChange: (state: GameState) => void) {
     this.container = container;
@@ -805,57 +849,84 @@ export class GameEngine {
   }
 
   private init() {
-    // Renderer
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    // Renderer — cinematic settings
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
     this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 0.8;
+    this.renderer.toneMappingExposure = 1.05;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.container.appendChild(this.renderer.domElement);
 
-    // Scene
+    // Scene — warm dusk atmosphere
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x0a0a15);
-    this.scene.fog = new THREE.FogExp2(0x0a0a15, 0.006);
+    this.scene.background = new THREE.Color(0x141018);
+    this.scene.fog = new THREE.FogExp2(0x1a1410, 0.0055);
 
     // Camera
-    this.camera = new THREE.PerspectiveCamera(45, this.container.clientWidth / this.container.clientHeight, 0.5, 300);
+    this.camera = new THREE.PerspectiveCamera(45, this.container.clientWidth / this.container.clientHeight, 0.5, 400);
     this.updateCameraPosition();
 
-    // Lighting
-    const ambient = new THREE.AmbientLight(0x223344, 0.5);
+    // ===== Lighting: golden-hour / dusk war mood =====
+    const ambient = new THREE.AmbientLight(0x35455e, 0.45);
     this.scene.add(ambient);
 
-    const dirLight = new THREE.DirectionalLight(0xffd4a0, 1.4);
-    dirLight.position.set(50, 70, 30);
+    // Warm key light (low sun) with high-res shadows
+    const dirLight = new THREE.DirectionalLight(0xffc27a, 2.2);
+    dirLight.position.set(60, 55, 20);
     dirLight.castShadow = true;
     dirLight.shadow.mapSize.width = 2048;
     dirLight.shadow.mapSize.height = 2048;
     dirLight.shadow.camera.near = 1;
-    dirLight.shadow.camera.far = 200;
+    dirLight.shadow.camera.far = 250;
     dirLight.shadow.camera.left = -80;
     dirLight.shadow.camera.right = 80;
     dirLight.shadow.camera.top = 80;
     dirLight.shadow.camera.bottom = -80;
-    dirLight.shadow.bias = -0.001;
-    dirLight.shadow.normalBias = 0.02;
+    dirLight.shadow.bias = -0.0008;
+    dirLight.shadow.normalBias = 0.03;
+    this.dirLight = dirLight;
     this.scene.add(dirLight);
+    this.scene.add(dirLight.target);
+    dirLight.target.position.set(60, 0, 60);
 
-    const hemiLight = new THREE.HemisphereLight(0x6688aa, 0x332211, 0.35);
+    // Sky/ground bounce
+    const hemiLight = new THREE.HemisphereLight(0x7d9cc0, 0x40301c, 0.5);
     this.scene.add(hemiLight);
 
-    // Subtle fill light from opposite direction
-    const fillLight = new THREE.DirectionalLight(0x445566, 0.3);
-    fillLight.position.set(-30, 20, -40);
+    // Cool rim/fill light from opposite side for depth separation
+    const fillLight = new THREE.DirectionalLight(0x5a78a8, 0.55);
+    fillLight.position.set(-40, 25, -50);
     this.scene.add(fillLight);
+
+    // Faint warm glow near the horizon behind enemy base (battle fires)
+    const fireGlow = new THREE.PointLight(0xff7733, 1.2, 45, 2);
+    fireGlow.position.set(100, 4, 100);
+    this.scene.add(fireGlow);
+    const fireGlow2 = new THREE.PointLight(0xff5522, 0.8, 35, 2);
+    fireGlow2.position.set(30, 3, 85);
+    this.scene.add(fireGlow2);
 
     // Sky
     this.createSky();
 
     // Terrain
     this.createTerrain();
+
+    // ===== Post-processing: bloom for muzzle flashes, explosions & glows =====
+    this.composer = new EffectComposer(this.renderer);
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(this.container.clientWidth, this.container.clientHeight),
+      0.55,   // strength
+      0.6,    // radius
+      0.82    // threshold — only bright emissive things bloom
+    );
+    this.composer.addPass(this.bloomPass);
+    this.composer.addPass(new OutputPass());
+    this.composer.setSize(this.container.clientWidth, this.container.clientHeight);
 
     // Create meshes for existing objects
     this.syncMeshes();
@@ -881,14 +952,15 @@ export class GameEngine {
   }
 
   private createSky() {
-    // Gradient sky dome
-    const skyGeo = new THREE.SphereGeometry(150, 32, 16);
+    // Gradient sky dome with dusk horizon glow, stars and a low sun disc
+    const skyGeo = new THREE.SphereGeometry(200, 32, 16);
     const skyMat = new THREE.ShaderMaterial({
       uniforms: {
-        topColor: { value: new THREE.Color(0x0a0a1a) },
-        bottomColor: { value: new THREE.Color(0x1a1510) },
-        offset: { value: 10 },
-        exponent: { value: 0.6 }
+        topColor: { value: new THREE.Color(0x07080f) },
+        midColor: { value: new THREE.Color(0x1a1424) },
+        bottomColor: { value: new THREE.Color(0x5a3418) },
+        sunDir: { value: new THREE.Vector3(0.62, 0.12, 0.25).normalize() },
+        time: { value: 0 }
       },
       vertexShader: `
         varying vec3 vWorldPosition;
@@ -900,24 +972,51 @@ export class GameEngine {
       `,
       fragmentShader: `
         uniform vec3 topColor;
+        uniform vec3 midColor;
         uniform vec3 bottomColor;
-        uniform float offset;
-        uniform float exponent;
+        uniform vec3 sunDir;
+        uniform float time;
         varying vec3 vWorldPosition;
+
+        float hash(vec2 p) {
+          return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+        }
+
         void main() {
-          float h = normalize(vWorldPosition + offset).y;
-          gl_FragColor = vec4(mix(bottomColor, topColor, max(pow(max(h, 0.0), exponent), 0.0)), 1.0);
+          vec3 dir = normalize(vWorldPosition);
+          float h = clamp(dir.y, -1.0, 1.0);
+
+          // Three-stop gradient: warm horizon -> dusky purple -> deep night
+          vec3 col = mix(bottomColor, midColor, smoothstep(-0.02, 0.22, h));
+          col = mix(col, topColor, smoothstep(0.15, 0.65, h));
+
+          // Sun glow near horizon
+          float sunAmt = pow(max(dot(dir, sunDir), 0.0), 8.0);
+          col += vec3(1.0, 0.45, 0.12) * sunAmt * 0.9;
+          float halo = pow(max(dot(dir, sunDir), 0.0), 2.0);
+          col += vec3(0.5, 0.22, 0.06) * halo * 0.25;
+
+          // Faint stars in the upper sky (twinkling)
+          if (h > 0.25) {
+            vec2 cell = floor(dir.xz * 220.0 + dir.y * 60.0);
+            float star = step(0.9965, hash(cell));
+            float twinkle = 0.6 + 0.4 * sin(time * 2.0 + hash(cell + 3.7) * 40.0);
+            col += vec3(0.8, 0.85, 1.0) * star * twinkle * smoothstep(0.25, 0.6, h);
+          }
+
+          gl_FragColor = vec4(col, 1.0);
         }
       `,
       side: THREE.BackSide
     });
     const sky = new THREE.Mesh(skyGeo, skyMat);
+    sky.name = 'skyDome';
     this.scene.add(sky);
   }
 
   private createTerrain() {
     const size = MAP_SIZE;
-    const segments = 120;
+    const segments = 160;
     const geometry = new THREE.PlaneGeometry(size, size, segments, segments);
     geometry.rotateX(-Math.PI / 2);
 
@@ -930,25 +1029,44 @@ export class GameEngine {
       const h = getTerrainHeight(x + size / 2, z + size / 2);
       positions.setY(i, h);
 
-      // Color based on height and noise
-      const n = smoothNoise(x + 50, z + 50, 5);
+      // Varied terrain palette: olive earth, sand patches, dry grass, rock
+      const n = smoothNoise(x + 50, z + 50, 6);          // fine variation
+      const patch = smoothNoise(x * 0.7 + 13, z * 0.7 + 7, 9); // large color patches
       let r, g, b;
       if (h < 0.5) {
-        r = 0.15 + n * 0.05; g = 0.18 + n * 0.05; b = 0.12;
+        // Dark olive soil
+        r = 0.14 + n * 0.04; g = 0.17 + n * 0.04; b = 0.10 + n * 0.02;
       } else if (h < 2) {
-        r = 0.2 + n * 0.1; g = 0.22 + n * 0.08; b = 0.15;
+        // Mix soil with sandy/earthy patches
+        const t = Math.min(1, Math.max(0, (patch - 0.35) * 2.2));
+        r = 0.19 + n * 0.06 + t * 0.10;
+        g = 0.20 + n * 0.05 + t * 0.05;
+        b = 0.12 + n * 0.03;
       } else {
-        r = 0.25 + n * 0.1; g = 0.2 + n * 0.05; b = 0.15;
+        // Elevated rocky ground
+        const t = Math.min(1, Math.max(0, (patch - 0.5)));
+        r = 0.26 + n * 0.08 - t * 0.04;
+        g = 0.22 + n * 0.06;
+        b = 0.16 + n * 0.05 + t * 0.04;
       }
-      // Roads
+
+      // Roads — lighter dust color with soft edges and slight texture
       const roadDist1 = Math.abs(x - z) / 1.414;
       const roadDist2 = Math.abs(x + z - size) / 1.414;
-      if (roadDist1 < 1.5 || roadDist2 < 1.5) {
-        r = 0.18; g = 0.18; b = 0.17;
+      const roadD = Math.min(roadDist1, roadDist2);
+      if (roadD < 2.2) {
+        const edge = 1 - Math.pow(Math.min(1, roadD / 2.2), 3); // soft falloff
+        const rd = 0.30 + n * 0.05;
+        r = r * (1 - edge) + rd * edge;
+        g = g * (1 - edge) + (rd * 0.93) * edge;
+        b = b * (1 - edge) + (rd * 0.80) * edge;
       }
-      colors[i * 3] = r;
-      colors[i * 3 + 1] = g;
-      colors[i * 3 + 2] = b;
+
+      // Subtle height-based ambient occlusion in valleys
+      const ao = 0.85 + Math.min(0.15, h * 0.08);
+      colors[i * 3] = r * ao;
+      colors[i * 3 + 1] = g * ao;
+      colors[i * 3 + 2] = b * ao;
     }
 
     geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
@@ -956,8 +1074,8 @@ export class GameEngine {
 
     const material = new THREE.MeshStandardMaterial({
       vertexColors: true,
-      roughness: 0.9,
-      metalness: 0.05,
+      roughness: 0.92,
+      metalness: 0.04,
       flatShading: false
     });
 
@@ -982,55 +1100,86 @@ export class GameEngine {
   }
 
   private addEnvironmentDetails() {
-    // Scattered rocks
-    const rockGeo = new THREE.DodecahedronGeometry(1, 0);
-    const rockMat = new THREE.MeshStandardMaterial({ color: 0x555544, roughness: 0.9 });
-    for (let i = 0; i < 40; i++) {
+    // Shared materials (cheaper + consistent look)
+    const rockMat = new THREE.MeshStandardMaterial({ color: 0x5c5a4a, roughness: 0.95, metalness: 0.02 });
+    const woodMat = new THREE.MeshStandardMaterial({ color: 0x3a2a1a, roughness: 0.95 });
+
+    // Scattered rocks — random shapes & ground-hugging placement
+    for (let i = 0; i < 60; i++) {
       const x = Math.random() * MAP_SIZE;
       const z = Math.random() * MAP_SIZE;
       const h = getTerrainHeight(x, z);
       const scale = 0.3 + Math.random() * 0.8;
-      const rock = new THREE.Mesh(rockGeo, rockMat);
-      rock.position.set(x - MAP_SIZE / 2 + MAP_SIZE / 2, h, z - MAP_SIZE / 2 + MAP_SIZE / 2);
-      rock.position.x = x;
-      rock.position.z = z;
-      rock.scale.set(scale, scale * 0.6, scale);
-      rock.rotation.set(Math.random(), Math.random(), Math.random());
+      const geoType = Math.random();
+      const geo = geoType > 0.5
+        ? new THREE.DodecahedronGeometry(1, 0)
+        : new THREE.IcosahedronGeometry(1, 0);
+      const rock = new THREE.Mesh(geo, rockMat);
+      rock.position.set(x, h - scale * 0.15, z);
+      rock.scale.set(scale, scale * (0.45 + Math.random() * 0.3), scale);
+      rock.rotation.set(Math.random() * 0.5, Math.random() * Math.PI * 2, Math.random() * 0.4);
       rock.castShadow = true;
       rock.receiveShadow = true;
       this.scene.add(rock);
     }
 
-    // Dead trees
-    for (let i = 0; i < 20; i++) {
+    // Dead trees with richer branching
+    for (let i = 0; i < 26; i++) {
       const x = Math.random() * MAP_SIZE;
       const z = Math.random() * MAP_SIZE;
       const h = getTerrainHeight(x, z);
       const tree = new THREE.Group();
+      const trunkH = 1.6 + Math.random() * 1.2;
       const trunk = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.08, 0.12, 2, 5),
-        new THREE.MeshStandardMaterial({ color: 0x3a2a1a, roughness: 0.95 })
+        new THREE.CylinderGeometry(0.07, 0.14, trunkH, 6),
+        woodMat
       );
-      trunk.position.y = 1;
+      trunk.position.y = trunkH / 2;
+      trunk.rotation.z = (Math.random() - 0.5) * 0.15;
       tree.add(trunk);
       // Dead branches
-      for (let b = 0; b < 3; b++) {
+      const branchCount = 3 + Math.floor(Math.random() * 3);
+      for (let b = 0; b < branchCount; b++) {
         const branch = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.02, 0.04, 0.8, 4),
-          new THREE.MeshStandardMaterial({ color: 0x3a2a1a, roughness: 0.95 })
+          new THREE.CylinderGeometry(0.015, 0.045, 0.6 + Math.random() * 0.6, 4),
+          woodMat
         );
-        branch.position.set(0, 1.2 + b * 0.3, 0);
-        branch.rotation.z = (Math.random() - 0.5) * 1.5;
+        branch.position.set(0, trunkH * (0.5 + Math.random() * 0.5), 0);
+        branch.rotation.z = (Math.random() - 0.5) * 1.8;
         branch.rotation.y = Math.random() * Math.PI * 2;
         tree.add(branch);
       }
       tree.position.set(x, h, z);
-      tree.castShadow = true;
+      tree.traverse(c => { if (c instanceof THREE.Mesh) c.castShadow = true; });
       this.scene.add(tree);
     }
 
+    // Dry grass tufts (cheap crossed billboards) — adds ground detail
+    const tuftGeo = new THREE.PlaneGeometry(0.7, 0.45);
+    const tuftMat = new THREE.MeshStandardMaterial({
+      color: 0x6b5d36, roughness: 1, side: THREE.DoubleSide,
+      transparent: true, alphaTest: 0.4
+    });
+    for (let i = 0; i < 90; i++) {
+      const x = Math.random() * MAP_SIZE;
+      const z = Math.random() * MAP_SIZE;
+      const h = getTerrainHeight(x, z);
+      const tuft = new THREE.Group();
+      const p1 = new THREE.Mesh(tuftGeo, tuftMat);
+      p1.position.y = 0.2;
+      const p2 = new THREE.Mesh(tuftGeo, tuftMat);
+      p2.position.y = 0.2;
+      p2.rotation.y = Math.PI / 2;
+      tuft.add(p1, p2);
+      const s = 0.6 + Math.random() * 0.9;
+      tuft.scale.setScalar(s);
+      tuft.position.set(x, h, z);
+      tuft.rotation.y = Math.random() * Math.PI;
+      this.scene.add(tuft);
+    }
+
     // Ruined structures
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 10; i++) {
       const x = 30 + Math.random() * 60;
       const z = 30 + Math.random() * 60;
       const h = getTerrainHeight(x, z);
@@ -1038,23 +1187,55 @@ export class GameEngine {
       const wallH = 1 + Math.random() * 2;
       const wall = new THREE.Mesh(
         new THREE.BoxGeometry(2 + Math.random() * 2, wallH, 0.3),
-        new THREE.MeshStandardMaterial({ color: 0x666655, roughness: 0.95 })
+        new THREE.MeshStandardMaterial({ color: 0x6e6c5e, roughness: 0.95 })
       );
       wall.position.y = wallH / 2;
       wall.rotation.y = Math.random() * Math.PI;
       ruin.add(wall);
-      if (Math.random() > 0.5) {
+      if (Math.random() > 0.4) {
         const wall2 = new THREE.Mesh(
           new THREE.BoxGeometry(1.5, wallH * 0.7, 0.3),
-          new THREE.MeshStandardMaterial({ color: 0x555544, roughness: 0.95 })
+          new THREE.MeshStandardMaterial({ color: 0x5c5a4c, roughness: 0.95 })
         );
         wall2.position.set(1, wallH * 0.35, 1);
         wall2.rotation.y = Math.PI / 2 + Math.random() * 0.3;
         ruin.add(wall2);
       }
+      // Rubble at the base
+      for (let r = 0; r < 4; r++) {
+        const rubble = new THREE.Mesh(
+          new THREE.BoxGeometry(0.25 + Math.random() * 0.3, 0.2, 0.25 + Math.random() * 0.3),
+          new THREE.MeshStandardMaterial({ color: 0x585648, roughness: 0.95 })
+        );
+        rubble.position.set((Math.random() - 0.5) * 3, 0.1, (Math.random() - 0.5) * 3);
+        rubble.rotation.y = Math.random() * Math.PI;
+        ruin.add(rubble);
+      }
       ruin.position.set(x, h, z);
       ruin.traverse(c => { if (c instanceof THREE.Mesh) { c.castShadow = true; c.receiveShadow = true; } });
       this.scene.add(ruin);
+    }
+
+    // Barrels & crates near bases — small props for scale
+    const barrelGeo = new THREE.CylinderGeometry(0.28, 0.32, 0.75, 10);
+    const barrelMat = new THREE.MeshStandardMaterial({ color: 0x7a5c2e, roughness: 0.7, metalness: 0.3 });
+    const crateGeo = new THREE.BoxGeometry(0.6, 0.6, 0.6);
+    const crateMat = new THREE.MeshStandardMaterial({ color: 0x5c4a2e, roughness: 0.9 });
+    const propSpots = [
+      { x: 25, z: 15 }, { x: 17, z: 21 }, { x: 31, z: 22 },
+      { x: 96, z: 106 }, { x: 104, z: 99 }, { x: 90, z: 100 }
+    ];
+    for (const spot of propSpots) {
+      const h = getTerrainHeight(spot.x, spot.z);
+      for (let p = 0; p < 3; p++) {
+        const isBarrel = Math.random() > 0.4;
+        const prop = new THREE.Mesh(isBarrel ? barrelGeo : crateGeo, isBarrel ? barrelMat : crateMat);
+        prop.position.set(spot.x + (Math.random() - 0.5) * 3, h + (isBarrel ? 0.37 : 0.3), spot.z + (Math.random() - 0.5) * 3);
+        prop.rotation.y = Math.random() * Math.PI;
+        prop.castShadow = true;
+        prop.receiveShadow = true;
+        this.scene.add(prop);
+      }
     }
 
     // Block pathfinding for buildings
@@ -1064,25 +1245,51 @@ export class GameEngine {
   }
 
   private createAtmosphericParticles() {
-    // Dust/haze particles
-    const particleCount = 200;
+    // Drifting dust motes — soft round sprites instead of hard squares
+    const particleCount = 350;
     const positions = new Float32Array(particleCount * 3);
     for (let i = 0; i < particleCount; i++) {
       positions[i * 3] = Math.random() * MAP_SIZE;
-      positions[i * 3 + 1] = Math.random() * 5 + 1;
+      positions[i * 3 + 1] = Math.random() * 6 + 0.5;
       positions[i * 3 + 2] = Math.random() * MAP_SIZE;
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     const mat = new THREE.PointsMaterial({
-      color: 0x998877,
-      size: 0.5,
+      map: getParticleSprite(),
+      color: 0xbba98a,
+      size: 0.45,
       transparent: true,
-      opacity: 0.3,
-      sizeAttenuation: true
+      opacity: 0.22,
+      sizeAttenuation: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending
     });
     this.ambientParticles = new THREE.Points(geo, mat);
     this.scene.add(this.ambientParticles);
+
+    // Warm embers rising near the enemy base — battle atmosphere
+    const emberCount = 60;
+    const ePositions = new Float32Array(emberCount * 3);
+    for (let i = 0; i < emberCount; i++) {
+      ePositions[i * 3] = 90 + Math.random() * 25;
+      ePositions[i * 3 + 1] = Math.random() * 8 + 1;
+      ePositions[i * 3 + 2] = 90 + Math.random() * 25;
+    }
+    const eGeo = new THREE.BufferGeometry();
+    eGeo.setAttribute('position', new THREE.BufferAttribute(ePositions, 3));
+    const eMat = new THREE.PointsMaterial({
+      map: getParticleSprite(),
+      color: 0xff8844,
+      size: 0.35,
+      transparent: true,
+      opacity: 0.55,
+      sizeAttenuation: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending
+    });
+    this.fogParticles = new THREE.Points(eGeo, eMat);
+    this.scene.add(this.fogParticles);
   }
 
   private syncMeshes() {
@@ -1152,42 +1359,63 @@ export class GameEngine {
         barrel.parent!.rotation.y = unit.turretRotation - unit.rotation;
       }
 
-      // Selection ring
+      // Selection ring (soft pulsing glow)
       const ring = mesh.getObjectByName('selectionRing') as THREE.Mesh;
       if (ring) {
         const ringMat = ring.material as THREE.MeshBasicMaterial;
-        ringMat.opacity = unit.selected ? 0.7 : 0;
+        ringMat.opacity = unit.selected ? 0.55 + Math.sin(this.state.time * 6) * 0.15 : 0;
         ringMat.color.setHex(unit.team === 'player' ? 0x00ff88 : 0xff4444);
       }
 
-      // Health bar
+      // Health bar — only shown when selected or damaged (cleaner battlefield)
       const hpBar = mesh.getObjectByName('hpBar') as THREE.Mesh;
       if (hpBar) {
         const ratio = unit.hp / unit.maxHp;
+        const show = unit.selected || ratio < 0.999;
+        const hpBg = mesh.getObjectByName('hpBg');
+        const hpBorder = mesh.getObjectByName('hpBorder');
+        hpBar.visible = show;
+        if (hpBg) hpBg.visible = show;
+        if (hpBorder) hpBorder.visible = show;
         hpBar.scale.x = Math.max(0.01, ratio);
         hpBar.position.x = -(1 - ratio);
         const hpMat = hpBar.material as THREE.MeshBasicMaterial;
-        if (ratio > 0.6) hpMat.color.setHex(0x00ff00);
-        else if (ratio > 0.3) hpMat.color.setHex(0xffaa00);
-        else hpMat.color.setHex(0xff3333);
-        // Billboard
-        hpBar.lookAt(this.camera.position);
-        const hpBg = mesh.getObjectByName('hpBg');
-        if (hpBg) hpBg.lookAt(this.camera.position);
+        if (ratio > 0.6) hpMat.color.setHex(0x3dff7a);
+        else if (ratio > 0.3) hpMat.color.setHex(0xffb020);
+        else hpMat.color.setHex(0xff4444);
+        if (show) {
+          // Billboard
+          hpBar.lookAt(this.camera.position);
+          if (hpBg) hpBg.lookAt(this.camera.position);
+          if (hpBorder) hpBorder.lookAt(this.camera.position);
+        }
       }
     }
 
-    // Update projectiles
+    // Update projectiles — glowing tracers picked up by bloom
     for (const proj of this.state.projectiles) {
       let mesh = this.projectileMeshes.get(proj.id);
       if (!mesh) {
         const geo = proj.type === 'rocket'
-          ? new THREE.ConeGeometry(0.08, 0.3, 6)
-          : new THREE.SphereGeometry(proj.type === 'shell' ? 0.1 : 0.05, 6, 4);
+          ? new THREE.ConeGeometry(0.08, 0.35, 6)
+          : new THREE.SphereGeometry(proj.type === 'shell' ? 0.12 : 0.07, 8, 6);
         const mat = new THREE.MeshBasicMaterial({
-          color: proj.type === 'rocket' ? 0xff6600 : 0xffff00
+          color: proj.type === 'rocket' ? 0xffaa44 : 0xfff2a8
         });
         mesh = new THREE.Mesh(geo, mat);
+        // Additive glow halo around the projectile
+        const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: getParticleSprite(),
+          color: proj.type === 'rocket' ? 0xff7722 : 0xffdd66,
+          transparent: true,
+          opacity: 0.85,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false
+        }));
+        glow.scale.setScalar(proj.type === 'rocket' ? 0.9 : 0.55);
+        glow.name = 'projGlow';
+        mesh.add(glow);
+        mesh.userData.isRocket = proj.type === 'rocket';
         this.scene.add(mesh);
         this.projectileMeshes.set(proj.id, mesh);
       }
@@ -1197,6 +1425,14 @@ export class GameEngine {
         proj.position.y + proj.velocity.y,
         proj.position.z + proj.velocity.z
       );
+      if (mesh.userData.isRocket) mesh.rotateX(Math.PI / 2);
+      // Flickering glow for bullets
+      const glowObj = mesh.getObjectByName('projGlow');
+      if (glowObj && glowObj instanceof THREE.Sprite) {
+        const base = mesh.userData.isRocket ? 0.9 : 0.55;
+        const f = base * (0.85 + Math.sin(this.state.time * 40 + proj.position.x) * 0.15);
+        glowObj.scale.setScalar(f);
+      }
     }
 
     // Clean up old projectile meshes
@@ -1228,12 +1464,28 @@ export class GameEngine {
   }
 
   // Game loop
+  private frameTimes: number[] = [];
+  private qualityChecked = false;
+
   private animate = () => {
     this.animationId = requestAnimationFrame(this.animate);
     const now = performance.now();
     const rawDt = (now - this.lastTime) / 1000;
     this.lastTime = now;
     const dt = Math.min(rawDt, 0.05); // Cap delta time
+
+    // Simple auto quality: if FPS drops below ~30 for a sustained period, disable bloom
+    this.frameTimes.push(rawDt);
+    if (this.frameTimes.length > 90) this.frameTimes.shift();
+    if (!this.qualityChecked && this.frameTimes.length >= 90) {
+      const avg = this.frameTimes.reduce((a, b) => a + b, 0) / this.frameTimes.length;
+      if (avg > 1 / 30 && this.quality === 'high') {
+        this.quality = 'low';
+        this.bloomPass.enabled = false;
+        this.renderer.setPixelRatio(1);
+      }
+      this.qualityChecked = true;
+    }
 
     if (!this.state.paused && !this.state.gameOver) {
       this.update(dt * this.state.gameSpeed);
@@ -1243,7 +1495,7 @@ export class GameEngine {
     this.updateMeshes();
     this.updateParticles(dt);
     this.updateAtmosphere(dt);
-    this.renderer.render(this.scene, this.camera);
+    this.composer.render();
     this.onStateChange({ ...this.state });
   }
 
@@ -1807,7 +2059,18 @@ export class GameEngine {
 
   // Effects
   private createExplosion(pos: Vec3, scale: number = 1) {
-    const count = Math.floor(15 * scale);
+    // Initial bright flash — big, short-lived, blooms hard
+    this.state.particles.push({
+      position: { x: pos.x, y: pos.y + 0.6 * scale, z: pos.z },
+      velocity: { x: 0, y: 0, z: 0 },
+      life: 0.12,
+      maxLife: 0.12,
+      size: 2.2 * scale,
+      color: '#fff2c0',
+      type: 'explosion'
+    });
+
+    const count = Math.floor(22 * scale);
     for (let i = 0; i < count; i++) {
       this.state.particles.push({
         position: { ...pos },
@@ -1819,24 +2082,24 @@ export class GameEngine {
         life: 0.5 + Math.random() * 1,
         maxLife: 1.5,
         size: 0.3 + Math.random() * 0.5 * scale,
-        color: Math.random() > 0.5 ? '#ff6600' : '#ffaa00',
+        color: Math.random() > 0.5 ? '#ff7718' : '#ffb020',
         type: 'explosion'
       });
     }
-    // Smoke
+    // Smoke — dark grey rising column
     for (let i = 0; i < count / 2; i++) {
       this.state.particles.push({
         position: { x: pos.x + (Math.random() - 0.5) * scale, y: pos.y + Math.random(), z: pos.z + (Math.random() - 0.5) * scale },
         velocity: { x: (Math.random() - 0.5) * 2, y: 2 + Math.random() * 3, z: (Math.random() - 0.5) * 2 },
-        life: 1 + Math.random() * 2,
-        maxLife: 3,
-        size: 0.5 + Math.random() * scale,
-        color: '#444444',
+        life: 1.5 + Math.random() * 2,
+        maxLife: 3.5,
+        size: 0.6 + Math.random() * scale,
+        color: i % 3 === 0 ? '#5a5550' : '#3c3a38',
         type: 'smoke'
       });
     }
-    // Sparks
-    for (let i = 0; i < 8; i++) {
+    // Sparks — bright yellow-white streaks
+    for (let i = 0; i < 12 * scale; i++) {
       this.state.particles.push({
         position: { ...pos },
         velocity: {
@@ -1846,70 +2109,95 @@ export class GameEngine {
         },
         life: 0.3 + Math.random() * 0.5,
         maxLife: 0.8,
-        size: 0.1,
-        color: '#ffff00',
+        size: 0.12,
+        color: Math.random() > 0.4 ? '#ffee66' : '#ffffff',
         type: 'spark'
       });
     }
   }
 
   private createMuzzleFlash(pos: Vec3) {
-    for (let i = 0; i < 3; i++) {
+    // Bright core flash (blooms) + warm sparks
+    this.state.particles.push({
+      position: { ...pos },
+      velocity: { x: 0, y: 0, z: 0 },
+      life: 0.08,
+      maxLife: 0.08,
+      size: 0.55,
+      color: '#fff4b0',
+      type: 'spark'
+    });
+    for (let i = 0; i < 4; i++) {
       this.state.particles.push({
         position: { ...pos },
-        velocity: { x: (Math.random() - 0.5) * 3, y: Math.random() * 2, z: (Math.random() - 0.5) * 3 },
-        life: 0.1 + Math.random() * 0.1,
-        maxLife: 0.2,
-        size: 0.2,
-        color: '#ffdd00',
+        velocity: { x: (Math.random() - 0.5) * 4, y: Math.random() * 2.5, z: (Math.random() - 0.5) * 4 },
+        life: 0.1 + Math.random() * 0.12,
+        maxLife: 0.22,
+        size: 0.16,
+        color: '#ffcc33',
         type: 'spark'
       });
     }
+    // Small smoke puff
+    this.state.particles.push({
+      position: { x: pos.x, y: pos.y + 0.15, z: pos.z },
+      velocity: { x: 0, y: 1.2, z: 0 },
+      life: 0.6,
+      maxLife: 0.6,
+      size: 0.3,
+      color: '#6a6560',
+      type: 'smoke'
+    });
   }
 
   private createHitEffect(pos: Vec3) {
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 6; i++) {
       this.state.particles.push({
         position: { ...pos },
         velocity: { x: (Math.random() - 0.5) * 5, y: Math.random() * 4, z: (Math.random() - 0.5) * 5 },
         life: 0.2 + Math.random() * 0.3,
         maxLife: 0.5,
-        size: 0.15,
-        color: '#ffaa00',
+        size: 0.13,
+        color: Math.random() > 0.5 ? '#ffbb44' : '#ffe98a',
         type: 'spark'
       });
     }
-    // Dust
+    // Dust puff
     this.state.particles.push({
       position: { ...pos },
       velocity: { x: 0, y: 1.5, z: 0 },
       life: 0.5,
       maxLife: 0.5,
-      size: 0.8,
-      color: '#887766',
+      size: 0.7,
+      color: '#9c8a70',
       type: 'dust'
     });
   }
 
-  private particlePool: THREE.Mesh[] = [];
-  private particlePoolSize = 100;
+  private particlePool: THREE.Sprite[] = [];
+  private particlePoolSize = 260;
   private particlePoolIndex = 0;
 
   private initParticlePool() {
-    const geo = new THREE.SphereGeometry(0.2, 4, 4);
     for (let i = 0; i < this.particlePoolSize; i++) {
-      const mat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 });
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.visible = false;
-      this.scene.add(mesh);
-      this.particlePool.push(mesh);
+      const mat = new THREE.SpriteMaterial({
+        map: getParticleSprite(),
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending
+      });
+      const sprite = new THREE.Sprite(mat);
+      sprite.visible = false;
+      this.scene.add(sprite);
+      this.particlePool.push(sprite);
     }
   }
 
   private updateParticles(dt: number) {
     if (this.particlePool.length === 0) this.initParticlePool();
 
-    // Hide all pool meshes first
+    // Hide all pool sprites first
     for (const mesh of this.particlePool) {
       mesh.visible = false;
     }
@@ -1930,16 +2218,33 @@ export class GameEngine {
         p.velocity.y -= 9.8 * dt;
       }
 
-      // Use pool
+      // Use sprite pool — soft round particles instead of hard spheres
       if (this.particlePoolIndex < this.particlePool.length) {
         const mesh = this.particlePool[this.particlePoolIndex];
         this.particlePoolIndex++;
-        const alpha = p.life / p.maxLife;
-        const scale = p.size * alpha;
-        mesh.scale.set(scale, scale, scale);
+        const t = Math.max(0, Math.min(1, p.life / p.maxLife));
+        let scale: number, opacity: number;
+        if (p.type === 'smoke') {
+          // Smoke grows and fades slowly
+          scale = p.size * (2.5 - t * 1.2);
+          opacity = t * 0.35;
+        } else if (p.type === 'dust') {
+          scale = p.size * 2.2;
+          opacity = t * 0.4;
+        } else if (p.type === 'explosion') {
+          // Bright flash early, shrinking ember later
+          scale = p.size * (1 + (1 - t) * 1.6);
+          opacity = Math.min(1, t * 1.6);
+        } else {
+          // Sparks — small & intense, glow via bloom
+          scale = p.size * 2.5;
+          opacity = t;
+        }
+        mesh.scale.setScalar(Math.max(0.01, scale));
         mesh.position.set(p.position.x, p.position.y, p.position.z);
-        (mesh.material as THREE.MeshBasicMaterial).color.set(p.color);
-        (mesh.material as THREE.MeshBasicMaterial).opacity = alpha * 0.8;
+        const mat = mesh.material as THREE.SpriteMaterial;
+        mat.color.set(p.color);
+        mat.opacity = opacity;
         mesh.visible = true;
       }
 
@@ -1953,14 +2258,45 @@ export class GameEngine {
       for (let i = 0; i < positions.count; i++) {
         let x = positions.getX(i);
         let y = positions.getY(i);
-        x += Math.sin(this.state.time * 0.1 + i) * dt * 0.5;
+        x += Math.sin(this.state.time * 0.1 + i) * dt * 0.5 + dt * 0.3;
         y += Math.sin(this.state.time * 0.2 + i * 0.5) * dt * 0.2;
         if (x > MAP_SIZE) x = 0;
         if (x < 0) x = MAP_SIZE;
+        if (y > 7) y = 0.5;
+        if (y < 0.3) y = 6.5;
         positions.setX(i, x);
         positions.setY(i, y);
       }
       positions.needsUpdate = true;
+    }
+    // Embers rise and swirl near the enemy base
+    if (this.fogParticles) {
+      const positions = this.fogParticles.geometry.attributes.position;
+      for (let i = 0; i < positions.count; i++) {
+        let x = positions.getX(i);
+        let y = positions.getY(i);
+        let z = positions.getZ(i);
+        y += dt * (0.8 + (i % 5) * 0.15);
+        x += Math.sin(this.state.time * 0.8 + i) * dt * 0.6;
+        z += Math.cos(this.state.time * 0.6 + i * 1.3) * dt * 0.5;
+        if (y > 10) { y = 0.5; x = 90 + Math.random() * 25; z = 90 + Math.random() * 25; }
+        positions.setX(i, x);
+        positions.setY(i, y);
+        positions.setZ(i, z);
+      }
+      positions.needsUpdate = true;
+    }
+    // Animate sky (star twinkle)
+    const sky = this.scene.getObjectByName('skyDome');
+    if (sky) {
+      const mat = (sky as THREE.Mesh).material as THREE.ShaderMaterial;
+      if (mat.uniforms?.time) mat.uniforms.time.value = this.state.time;
+    }
+    // Keep shadow frustum centered on the camera target for crisp shadows everywhere
+    if (this.dirLight) {
+      this.dirLight.target.position.set(this.cameraTarget.x, 0, this.cameraTarget.z);
+      this.dirLight.position.set(this.cameraTarget.x + 45, 60, this.cameraTarget.z + 15);
+      this.dirLight.target.updateMatrixWorld();
     }
   }
 
@@ -1971,6 +2307,7 @@ export class GameEngine {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+    this.composer.setSize(w, h);
   }
 
   private onMouseDown = (e: MouseEvent) => {
