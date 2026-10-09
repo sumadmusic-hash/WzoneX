@@ -54,6 +54,99 @@ function genId(): string {
 }
 
 // Vehicle mesh creation
+
+// ===== Shared geometry/material caches =====
+// Units & buildings are rebuilt from identical primitives many times per match.
+// Caching geometries and materials keeps GPU memory/uploads low and avoids GC churn.
+const geoCache = new Map<string, THREE.BufferGeometry>();
+function cachedGeo(key: string, make: () => THREE.BufferGeometry): THREE.BufferGeometry {
+  let g = geoCache.get(key);
+  if (!g) { g = make(); geoCache.set(key, g); }
+  return g;
+}
+const boxGeo = (w: number, h: number, d: number) =>
+  cachedGeo(`b${w}_${h}_${d}`, () => new THREE.BoxGeometry(w, h, d));
+const cylGeo = (rt: number, rb: number, h: number, seg: number) =>
+  cachedGeo(`c${rt}_${rb}_${h}_${seg}`, () => new THREE.CylinderGeometry(rt, rb, h, seg));
+const sphGeo = (r: number, ws: number, hs: number) =>
+  cachedGeo(`s${r}_${ws}_${hs}`, () => new THREE.SphereGeometry(r, ws, hs));
+const planeGeo = (w: number, h: number) =>
+  cachedGeo(`p${w}_${h}`, () => new THREE.PlaneGeometry(w, h));
+const ringGeo = (i: number, o: number, seg: number) =>
+  cachedGeo(`r${i}_${o}_${seg}`, () => new THREE.RingGeometry(i, o, seg));
+
+const stdMatCache = new Map<string, THREE.MeshStandardMaterial>();
+function stdMat(color: number, metalness = 0.3, roughness = 0.7): THREE.MeshStandardMaterial {
+  const key = `${color}_${metalness}_${roughness}`;
+  let m = stdMatCache.get(key);
+  if (!m) {
+    m = new THREE.MeshStandardMaterial({ color, metalness, roughness });
+    stdMatCache.set(key, m);
+  }
+  return m;
+}
+const basicMatCache = new Map<string, THREE.MeshBasicMaterial>();
+function basicMat(color: number, opts?: Partial<{ opacity: number; transparent: boolean; additive: boolean }>): THREE.MeshBasicMaterial {
+  const o = opts ?? {};
+  const key = `${color}_${o.opacity ?? 1}_${o.transparent ?? false}_${o.additive ?? false}`;
+  let m = basicMatCache.get(key);
+  if (!m) {
+    m = new THREE.MeshBasicMaterial({
+      color, side: THREE.DoubleSide,
+      transparent: o.transparent ?? false, opacity: o.opacity ?? 1,
+      depthWrite: false
+    });
+    if (o.additive) m.blending = THREE.AdditiveBlending;
+    basicMatCache.set(key, m);
+  }
+  return m;
+}
+
+// Health-bar fills: one shared material per team/color state instead of per unit
+const hpFillMats: Record<string, THREE.MeshBasicMaterial> = {
+  goodP: new THREE.MeshBasicMaterial({ color: 0x3dff7a, side: THREE.DoubleSide, depthWrite: false }),
+  goodE: new THREE.MeshBasicMaterial({ color: 0xff5555, side: THREE.DoubleSide, depthWrite: false }),
+  warn: new THREE.MeshBasicMaterial({ color: 0xffb020, side: THREE.DoubleSide, depthWrite: false }),
+  bad: new THREE.MeshBasicMaterial({ color: 0xff4444, side: THREE.DoubleSide, depthWrite: false })
+};
+
+// Projectiles reuse a handful of geometries/materials/sprites instead of allocating per shot
+interface ProjAssets { bullet: THREE.Mesh; shell: THREE.Mesh; rocket: THREE.Mesh }
+let projAssets: ProjAssets | null = null;
+function getProjAssets(): ProjAssets {
+  if (!projAssets) {
+    const mk = (geo: THREE.BufferGeometry, mat: THREE.Material, glowMat: THREE.SpriteMaterial, glowScale: number, isRocket: boolean) => {
+      const mesh = new THREE.Mesh(geo, mat);
+      const glow = new THREE.Sprite(glowMat.clone()); // clone so per-projectile flicker scale is independent
+      glow.scale.setScalar(glowScale);
+      glow.name = 'projGlow';
+      mesh.add(glow);
+      mesh.userData.isRocket = isRocket;
+      mesh.userData.baseGlow = glowScale;
+      return mesh;
+    };
+    const sprite = getParticleSprite();
+    projAssets = {
+      bullet: mk(
+        new THREE.SphereGeometry(0.07, 6, 4),
+        new THREE.MeshBasicMaterial({ color: 0xfff2a8 }),
+        new THREE.SpriteMaterial({ map: sprite, color: 0xffdd66, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }),
+        0.55, false),
+      shell: mk(
+        new THREE.SphereGeometry(0.12, 8, 6),
+        new THREE.MeshBasicMaterial({ color: 0xfff2a8 }),
+        new THREE.SpriteMaterial({ map: sprite, color: 0xffdd66, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }),
+        0.55, false),
+      rocket: mk(
+        new THREE.ConeGeometry(0.08, 0.35, 6),
+        new THREE.MeshBasicMaterial({ color: 0xffaa44 }),
+        new THREE.SpriteMaterial({ map: sprite, color: 0xff7722, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }),
+        0.9, true)
+    };
+  }
+  return projAssets;
+}
+
 function createVehicleMesh(type: UnitType, team: Team): THREE.Group {
   const group = new THREE.Group();
   const teamColor = team === 'player' ? 0x3a7d44 : 0x8b2020;
@@ -61,8 +154,9 @@ function createVehicleMesh(type: UnitType, team: Team): THREE.Group {
   const metalColor = 0x4a4a4a;
   const trackColor = 0x2a2a2a;
 
+  // Cached materials: identical colors reuse one GPU material across all vehicles
   const mat = (color: number, metalness = 0.3, roughness = 0.7) =>
-    new THREE.MeshStandardMaterial({ color, metalness, roughness });
+    stdMat(color, metalness, roughness);
 
   switch (type) {
     case 'scout': {
@@ -299,13 +393,10 @@ function createVehicleMesh(type: UnitType, team: Team): THREE.Group {
 
   // Add selection indicator ring (glowing — picked up by bloom pass)
   const ring = new THREE.Mesh(
-    new THREE.RingGeometry(1.45, 1.68, 48),
-    new THREE.MeshBasicMaterial({
-      color: team === 'player' ? 0x00ff88 : 0xff4444,
-      side: THREE.DoubleSide, transparent: true, opacity: 0,
-      blending: THREE.AdditiveBlending, depthWrite: false
-    })
+    ringGeo(1.45, 1.68, 48),
+    basicMat(team === 'player' ? 0x00ff88 : 0xff4444, { transparent: true, additive: true })
   );
+  ring.visible = false;
   ring.rotation.x = -Math.PI / 2;
   ring.position.y = 0.05;
   ring.name = 'selectionRing';
@@ -313,24 +404,24 @@ function createVehicleMesh(type: UnitType, team: Team): THREE.Group {
 
   // Health bar (dark background + glowing fill)
   const hpBg = new THREE.Mesh(
-    new THREE.PlaneGeometry(2.1, 0.26),
-    new THREE.MeshBasicMaterial({ color: 0x0a0a0a, side: THREE.DoubleSide, transparent: true, opacity: 0.9, depthWrite: false })
+    planeGeo(2.1, 0.26),
+    basicMat(0x0a0a0a, { transparent: true, opacity: 0.9 })
   );
   hpBg.position.set(0, 2.5, 0);
   hpBg.name = 'hpBg';
   group.add(hpBg);
 
   const hpBorder = new THREE.Mesh(
-    new THREE.PlaneGeometry(2.18, 0.34),
-    new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.DoubleSide, transparent: true, opacity: 0.55, depthWrite: false })
+    planeGeo(2.18, 0.34),
+    basicMat(0x000000, { transparent: true, opacity: 0.55 })
   );
   hpBorder.position.set(0, 2.5, -0.01);
   hpBorder.name = 'hpBorder';
   group.add(hpBorder);
 
   const hpBar = new THREE.Mesh(
-    new THREE.PlaneGeometry(2, 0.16),
-    new THREE.MeshBasicMaterial({ color: team === 'player' ? 0x3dff7a : 0xff5555, side: THREE.DoubleSide, depthWrite: false })
+    planeGeo(2, 0.16),
+    team === 'player' ? hpFillMats.goodP : hpFillMats.goodE
   );
   hpBar.position.set(0, 2.5, 0.01);
   hpBar.name = 'hpBar';
@@ -377,8 +468,9 @@ function createBuildingMesh(type: BuildingType, team: Team): THREE.Group {
   const concrete = 0x666666;
   const metal = 0x555555;
 
+  // Cached materials — buildings of the same type/team share GPU materials
   const mat = (color: number, metalness = 0.2, roughness = 0.8) =>
-    new THREE.MeshStandardMaterial({ color, metalness, roughness });
+    stdMat(color, metalness, roughness);
 
   switch (type) {
     case 'hq': {
@@ -620,69 +712,119 @@ class Pathfinder {
   findPath(start: Vec3, end: Vec3): Vec3[] {
     const [sx, sz] = this.worldToGrid(start.x, start.z);
     const [ex, ez] = this.worldToGrid(end.x, end.z);
+    const N = this.gridSize;
 
-    if (sx < 0 || sx >= this.gridSize || sz < 0 || sz >= this.gridSize) return [end];
-    if (ex < 0 || ex >= this.gridSize || ez < 0 || ez >= this.gridSize) return [end];
+    if (sx < 0 || sx >= N || sz < 0 || sz >= N) return [end];
+    if (ex < 0 || ex >= N || ez < 0 || ez >= N) return [end];
+    if (sx === ex && sz === ez) return [{ ...end, y: getTerrainHeight(end.x, end.z) }];
 
-    const open: { x: number; z: number; g: number; h: number; f: number; parent: any }[] = [];
-    const closed = new Set<string>();
-    const key = (x: number, z: number) => `${x},${z}`;
+    // Optimized A*: typed-array costs + binary min-heap instead of sorting the
+    // open list every iteration and using string keys in a Set.
+    const SIZE = N * N;
+    if (!this.gCosts || this.gCosts.length < SIZE) {
+      this.gCosts = new Float64Array(SIZE);
+      this.cameFrom = new Int32Array(SIZE);
+      this.stamp = new Int32Array(SIZE);
+    }
+    this.epoch++;
+    const epoch = this.epoch;
+    const gCosts = this.gCosts!, cameFrom = this.cameFrom!, stamp = this.stamp!;
 
-    const heuristic = (ax: number, az: number, bx: number, bz: number) =>
-      Math.abs(ax - bx) + Math.abs(az - bz);
+    const heapF: number[] = [];
+    const heapP: number[] = [];
+    const heapPush = (f: number, packed: number) => {
+      heapF.push(f); heapP.push(packed);
+      let i = heapF.length - 1;
+      while (i > 0) {
+        const p = (i - 1) >> 1;
+        if (heapF[p] <= heapF[i]) break;
+        const tf = heapF[p], tp = heapP[p];
+        heapF[p] = heapF[i]; heapP[p] = heapP[i];
+        heapF[i] = tf; heapP[i] = tp;
+        i = p;
+      }
+    };
+    const heapPop = (): number => {
+      const top = heapP[0];
+      const lastF = heapF.pop()!, lastP = heapP.pop()!;
+      if (heapF.length > 0) {
+        heapF[0] = lastF; heapP[0] = lastP;
+        let i = 0;
+        for (;;) {
+          const l = 2 * i + 1, r = l + 1;
+          let m = i;
+          if (l < heapF.length && heapF[l] < heapF[m]) m = l;
+          if (r < heapF.length && heapF[r] < heapF[m]) m = r;
+          if (m === i) break;
+          const tf = heapF[m], tp = heapP[m];
+          heapF[m] = heapF[i]; heapP[m] = heapP[i];
+          heapF[i] = tf; heapP[i] = tp;
+          i = m;
+        }
+      }
+      return top;
+    };
 
-    open.push({ x: sx, z: sz, g: 0, h: heuristic(sx, sz, ex, ez), f: heuristic(sx, sz, ex, ez), parent: null });
+    const startIdx = sz * N + sx, endIdx = ez * N + ex;
+    gCosts[startIdx] = 0;
+    stamp[startIdx] = epoch;
+    cameFrom[startIdx] = -1;
+    heapPush(Math.abs(sx - ex) + Math.abs(sz - ez), startIdx);
 
+    const neighbors = Pathfinder.NEIGHBORS;
+    let found = false;
     let iterations = 0;
-    const maxIter = 500;
+    const maxIter = 3000;
 
-    while (open.length > 0 && iterations < maxIter) {
+    while (heapF.length > 0 && iterations < maxIter) {
       iterations++;
-      open.sort((a, b) => a.f - b.f);
-      const current = open.shift()!;
+      const cIdx = heapPop();
+      if (cIdx === endIdx) { found = true; break; }
+      if (stamp[cIdx] === -epoch) continue; // already closed
+      stamp[cIdx] = -epoch; // mark closed (negative epoch)
 
-      if (current.x === ex && current.z === ez) {
-        const path: Vec3[] = [];
-        let node: any = current;
-        while (node) {
-          path.unshift(this.gridToWorld(node.x, node.z));
-          node = node.parent;
-        }
-        path[path.length - 1] = { ...end, y: getTerrainHeight(end.x, end.z) };
-        return path;
-      }
-
-      closed.add(key(current.x, current.z));
-
-      const neighbors = [
-        [1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]
-      ];
-
-      for (const [dx, dz] of neighbors) {
-        const nx = current.x + dx;
-        const nz = current.z + dz;
-        if (nx < 0 || nx >= this.gridSize || nz < 0 || nz >= this.gridSize) continue;
-        if (closed.has(key(nx, nz))) continue;
+      const cx = cIdx % N, cz = (cIdx / N) | 0;
+      const cg = gCosts[cIdx];
+      for (let k = 0; k < 8; k++) {
+        const dx = neighbors[k * 2], dz = neighbors[k * 2 + 1];
+        const nx = cx + dx, nz = cz + dz;
+        if (nx < 0 || nx >= N || nz < 0 || nz >= N) continue;
         if (this.grid[nx][nz] === 1) continue;
-
-        const g = current.g + (dx !== 0 && dz !== 0 ? 1.414 : 1);
-        const h = heuristic(nx, nz, ex, ez);
-        const existing = open.find(n => n.x === nx && n.z === nz);
-        if (existing) {
-          if (g < existing.g) {
-            existing.g = g;
-            existing.f = g + h;
-            existing.parent = current;
-          }
-        } else {
-          open.push({ x: nx, z: nz, g, h, f: g + h, parent: current });
-        }
+        const nIdx = nz * N + nx;
+        if (stamp[nIdx] === -epoch) continue;
+        const g = cg + (dx !== 0 && dz !== 0 ? 1.414 : 1);
+        if (stamp[nIdx] === epoch && g >= gCosts[nIdx]) continue;
+        gCosts[nIdx] = g;
+        cameFrom[nIdx] = cIdx;
+        stamp[nIdx] = epoch;
+        heapPush(g + Math.abs(nx - ex) + Math.abs(nz - ez), nIdx);
       }
+    }
+
+    if (found) {
+      const path: Vec3[] = [];
+      let cur = endIdx;
+      while (cur !== -1 && cur !== startIdx) {
+        const x = cur % N, z = (cur / N) | 0;
+        path.push(this.gridToWorld(x, z));
+        cur = cameFrom[cur];
+      }
+      path.reverse();
+      path[path.length - 1] = { ...end, y: getTerrainHeight(end.x, end.z) };
+      return path;
     }
 
     // If no path found, return direct path
     return [start, end];
   }
+
+  private static NEIGHBORS = new Int8Array([
+    1, 0, -1, 0, 0, 1, 0, -1, 1, 1, -1, -1, 1, -1, -1, 1
+  ]);
+  private gCosts: Float64Array | null = null;
+  private cameFrom: Int32Array | null = null;
+  private stamp: Int32Array | null = null;
+  private epoch = 0;
 }
 
 export class GameEngine {
@@ -1359,12 +1501,10 @@ export class GameEngine {
         barrel.parent!.rotation.y = unit.turretRotation - unit.rotation;
       }
 
-      // Selection ring (soft pulsing glow)
+      // Selection ring — shared material, only toggle visibility (pulse handled in shader-free way)
       const ring = mesh.getObjectByName('selectionRing') as THREE.Mesh;
       if (ring) {
-        const ringMat = ring.material as THREE.MeshBasicMaterial;
-        ringMat.opacity = unit.selected ? 0.55 + Math.sin(this.state.time * 6) * 0.15 : 0;
-        ringMat.color.setHex(unit.team === 'player' ? 0x00ff88 : 0xff4444);
+        ring.visible = unit.selected;
       }
 
       // Health bar — only shown when selected or damaged (cleaner battlefield)
@@ -1379,10 +1519,12 @@ export class GameEngine {
         if (hpBorder) hpBorder.visible = show;
         hpBar.scale.x = Math.max(0.01, ratio);
         hpBar.position.x = -(1 - ratio);
-        const hpMat = hpBar.material as THREE.MeshBasicMaterial;
-        if (ratio > 0.6) hpMat.color.setHex(0x3dff7a);
-        else if (ratio > 0.3) hpMat.color.setHex(0xffb020);
-        else hpMat.color.setHex(0xff4444);
+        // Swap to shared material instead of mutating a per-unit color (avoids
+        // breaking batching and redundant uniform uploads every frame)
+        const wantMat = ratio > 0.6
+          ? (unit.team === 'player' ? hpFillMats.goodP : hpFillMats.goodE)
+          : ratio > 0.3 ? hpFillMats.warn : hpFillMats.bad;
+        if (hpBar.material !== wantMat) hpBar.material = wantMat;
         if (show) {
           // Billboard
           hpBar.lookAt(this.camera.position);
